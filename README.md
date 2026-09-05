@@ -21,6 +21,25 @@ Use the first command for a documentation-only or custom implementation project.
 
 Before adding integrations, record the intended outcome, source systems, data ownership, refresh cadence, privacy classification, and approval expectations in project documentation. Add shared Python code under `src/` and repeatable project operations under `scripts/`.
 
+## Local-Only Setup
+
+GitHub is optional. To use this template on a machine without GitHub access, download the template ZIP from a trusted machine, extract it to a stable location such as `C:\Project-Templates\md-data-project-template`, and retain that folder as a clean master copy.
+
+For each new project, copy the master folder to the desired working location and rename it. A ZIP download does not include Git history, so the copy starts as an independent project. Initialize local Git when permitted by your workplace:
+
+```powershell
+Copy-Item -Recurse `
+   C:\Project-Templates\md-data-project-template `
+   C:\Work\DataProjects\my-new-project
+cd C:\Work\DataProjects\my-new-project
+
+git init -b main
+git add -A
+git commit -m "Initial project setup"
+```
+
+Run `uv sync --all-extras --dev` and `uv run pytest` in each project copy. When the template changes, download and store a new versioned master copy, such as `md-data-project-template-v1.1`; keep existing projects on their original template version unless they are deliberately upgraded.
+
 ## Data Lifecycle
 
 | Location | Purpose |
