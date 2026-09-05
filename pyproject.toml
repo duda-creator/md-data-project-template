@@ -1,0 +1,22 @@
+[project]
+name = "data-project-template"
+version = "0.1.0"
+description = "A database-agnostic Python template for data projects"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+profiling = [
+    "openpyxl>=3.1",
+    "pandas>=2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
