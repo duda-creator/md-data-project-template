@@ -84,7 +84,7 @@ class TemplateStructureTests(unittest.TestCase):
                     forbidden_term, content.lower(), path.relative_to(ROOT)
                 )
 
-    def test_spec_builder_extends_approved_spec(self) -> None:
+    def test_spec_builder_locks_approved_spec(self) -> None:
         builder = load_module(
             "template_spec_builder",
             ROOT / ".github/skills/md-table-spec-builder/scripts/build_table_spec.py",
@@ -97,12 +97,27 @@ class TemplateStructureTests(unittest.TestCase):
                 "column,dtype,distinct_pct,missing_values\norder_id,object,1,0\n",
                 encoding="utf-8",
             )
-            output, added, skipped, _ = builder.build_spec(profile)
-            self.assertEqual((added, skipped), (1, 0))
+            output = builder.default_output_path(profile)
+            self.assertEqual(
+                output,
+                root / "data/5_spec/2_interim/orders.spec.csv",
+            )
+            profile_rows, _ = builder.read_profile_rows(profile)
+            rows = builder.build_new_rows(
+                "orders.csv",
+                profile_rows,
+                builder.dedupe_and_fill_profile_columns(profile_rows),
+            )
+            builder.write_spec(rows, output)
             content = output.read_text(encoding="utf-8").replace(",Draft", ",Approved")
             output.write_text(content, encoding="utf-8")
-            _, added, skipped, _ = builder.build_spec(profile)
-            self.assertEqual((added, skipped), (0, 1))
+            result = subprocess.run(
+                [sys.executable, str(builder.__file__), str(profile)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fully Approved", result.stderr)
 
     @unittest.skipUnless(
         importlib.util.find_spec("pandas"), "profiling extra is not installed"

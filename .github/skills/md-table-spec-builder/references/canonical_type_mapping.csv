@@ -1,0 +1,10 @@
+Canonical Format,Meaning,Review Notes
+STRING(n),Text with a documented maximum length,n is a business or data-contract limit
+TEXT,Unbounded free text,
+INTEGER,Whole number within the project's standard integer range,
+BIGINT,Whole number that may exceed the standard integer range,
+"DECIMAL(p,s)",Fixed-precision decimal number,p is precision and s is scale
+BOOLEAN,True or false,
+DATE,Calendar date with no time component,
+TIMESTAMP,Date and time with no timezone component,
+TIMESTAMP_TZ,Date and time with timezone information,Confirm the agreed timezone and storage convention

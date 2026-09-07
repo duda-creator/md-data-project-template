@@ -1,4 +1,30 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""
+Build or extend a Table Specification from a profiling report.
+
+Reads a *_profiling.csv report and produces (or extends) a metadata
+specification CSV — one row per source column — ready for human review before
+it is handed to a later database implementation workflow.
+
+Deterministic enrichments applied by this script:
+- Source Extract and Source Column from profiling metadata.
+- Target Table inferred from Source Extract as stg_<extract_name_without_extension>.
+- Format from profiling dtype.
+- Business Role suggestion from threshold rules based on Format,
+  distinct_pct, and missing_values.
+
+If the output spec already exists, new rows are appended (existing rows,
+including anything already filled in, are preserved). If every existing row
+is already Approved, the file is treated as immutable and the script refuses
+to touch it — copy it forward to a new version first.
+
+Usage:
+    python build_table_spec.py <profiling_file> [-o <output_spec_file>]
+
+Examples:
+    python build_table_spec.py data/4_profiling/2_interim/cash_positions_profiling.csv
+    python build_table_spec.py data/4_profiling/2_interim/cash_positions_v2_profiling.csv -o data/5_spec/2_interim/cash_positions.spec.csv
+"""
 
 import argparse
 import csv
@@ -7,7 +33,9 @@ from pathlib import Path
 
 CANDIDATE_DELIMITERS = [",", ";", "\t", "|"]
 DELIMITER_NAMES = {",": "comma", ";": "semicolon", "\t": "tab", "|": "pipe"}
+
 PROFILE_REQUIRED_COLUMNS = {"column", "dtype", "distinct_pct", "missing_values"}
+
 SPEC_COLUMNS = [
     "Source Extract",
     "Source Column",
@@ -25,209 +53,326 @@ SPEC_COLUMNS = [
     "Status",
 ]
 
+DEFAULT_TYPE = "Optional"
+DEFAULT_STATUS = "Draft"
+
 
 def detect_delimiter(sample: str) -> str:
+    """Detect the delimiter from a text sample.
+
+    Tries csv.Sniffer first since it's more robust (handles quoted fields
+    correctly). Falls back to counting candidate delimiters in the first
+    line if the sniffer can't decide.
+    """
     try:
-        return (
-            csv.Sniffer()
-            .sniff(sample, delimiters="".join(CANDIDATE_DELIMITERS))
-            .delimiter
-        )
+        dialect = csv.Sniffer().sniff(sample, delimiters="".join(CANDIDATE_DELIMITERS))
+        return dialect.delimiter
     except csv.Error:
-        first_line = sample.splitlines()[0] if sample.splitlines() else ""
-        counts = {
-            delimiter: first_line.count(delimiter) for delimiter in CANDIDATE_DELIMITERS
-        }
-        best = max(counts, key=counts.get)
-        return best if counts[best] else ","
+        pass
+
+    lines = sample.splitlines()
+    first_line = lines[0] if lines else ""
+    counts = {d: first_line.count(d) for d in CANDIDATE_DELIMITERS}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
 
 
-def read_profile_rows(input_path: Path) -> tuple[list[dict[str, str]], str]:
-    with input_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        sample = handle.read(4096)
-        handle.seek(0)
+def read_profile_rows(input_path: Path) -> tuple[list[dict], str]:
+    """Read profiling rows, returning (rows, delimiter_used)."""
+    with open(input_path, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
         if not sample.strip():
-            raise ValueError(f"{input_path} is empty.")
+            raise ValueError(
+                f"{input_path} appears to be empty — no profiling rows found."
+            )
         delimiter = detect_delimiter(sample)
-        reader = csv.DictReader(handle, delimiter=delimiter)
-        fields = {field.strip() for field in reader.fieldnames or [] if field}
-        missing = PROFILE_REQUIRED_COLUMNS - fields
+        reader = csv.DictReader(f, delimiter=delimiter)
+        if not reader.fieldnames:
+            raise ValueError(f"{input_path} has no header row.")
+
+        header = {h.strip() for h in reader.fieldnames if h is not None}
+        missing = PROFILE_REQUIRED_COLUMNS - header
         if missing:
-            raise ValueError(f"{input_path} is missing: {', '.join(sorted(missing))}")
+            raise ValueError(
+                f"{input_path} is missing required profiling columns: {', '.join(sorted(missing))}"
+            )
+
         rows = list(reader)
-    if not rows:
-        raise ValueError(f"{input_path} has no profiling rows.")
+        if not rows:
+            raise ValueError(f"{input_path} has a header but no profiling rows.")
     return rows, delimiter
 
 
-def normalized_column_names(profile_rows: list[dict[str, str]]) -> list[str]:
-    counts: dict[str, int] = {}
-    result: list[str] = []
+def dedupe_and_fill_profile_columns(profile_rows: list[dict]) -> list[str]:
+    """Preserve row order while making every source column unique and non-blank.
+
+    - Blank names become Column_<position>, e.g. unnamed 3rd row -> Column_3.
+    - Duplicate names get an incrementing suffix on the 2nd+ occurrence,
+      e.g. Amount, Amount -> Amount, Amount_2.
+    """
+    seen_counts: dict[str, int] = {}
+    result = []
     for position, row in enumerate(profile_rows, start=1):
-        name = (row.get("column") or "").strip() or f"Column_{position}"
-        counts[name] = counts.get(name, 0) + 1
-        result.append(name if counts[name] == 1 else f"{name}_{counts[name]}")
+        raw_name = (row.get("column") or "").strip()
+        name = raw_name
+        if not name:
+            name = f"Column_{position}"
+        if name in seen_counts:
+            seen_counts[name] += 1
+            name = f"{name}_{seen_counts[name]}"
+        else:
+            seen_counts[name] = 1
+        result.append(name)
     return result
 
 
-def profile_base_name(input_path: Path) -> str:
-    return input_path.stem.removesuffix("_profiling")
+def to_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
-def infer_source_extract_name(input_path: Path) -> str:
-    return f"{profile_base_name(input_path)}.csv"
-
-
-def infer_target_table_name(source_extract: str) -> str:
-    return f"stg_{Path(source_extract).stem}"
-
-
-def default_output_path(input_path: Path) -> Path:
-    parts = list(input_path.parts)
-    if "4_profiling" in parts:
-        index = parts.index("4_profiling")
-        parts[index] = "5_spec"
-        return Path(*parts[:-1]) / f"{profile_base_name(input_path)}.spec.csv"
-    return input_path.with_name(f"{profile_base_name(input_path)}.spec.csv")
+def to_int(value: str | None) -> int | None:
+    f = to_float(value)
+    return int(f) if f is not None else None
 
 
 def canonical_format_from_dtype(dtype: str) -> str:
-    normalized = dtype.strip().lower()
-    if normalized in {"bool", "boolean"}:
+    d = dtype.strip().lower()
+    if d in {"bool", "boolean"}:
         return "BOOLEAN"
-    if "datetime" in normalized or "timestamp" in normalized:
+    if "datetime" in d or "timestamp" in d:
         return "TIMESTAMP"
-    if normalized == "date":
+    if d == "date":
         return "DATE"
-    if "int" in normalized:
+    if "int" in d:
         return "BIGINT"
-    if any(value in normalized for value in {"float", "double", "decimal"}):
+    if "float" in d or "double" in d or "decimal" in d:
         return "DECIMAL(18,6)"
+    if d in {"str", "string", "object", "category"}:
+        return "TEXT"
     return "TEXT"
 
 
-def to_float(value: str | None) -> float:
-    try:
-        return float(value or 0)
-    except ValueError:
-        return 0.0
-
-
-def to_int(value: str | None) -> int:
-    return int(to_float(value))
-
-
 def suggest_business_role(
-    format_value: str, distinct_pct: float, missing_values: int
+    fmt: str, distinct_pct: float | None, missing_values: int | None
 ) -> str:
-    if format_value in {"INTEGER", "BIGINT", "DECIMAL(18,6)", "BOOLEAN"}:
-        if distinct_pct >= 0.60 and missing_values == 0:
+    """Deterministic threshold rules for an initial Business Role suggestion."""
+    d = distinct_pct if distinct_pct is not None else 0.0
+    m = missing_values if missing_values is not None else 0
+    numeric_formats = {"INTEGER", "BIGINT", "DECIMAL(18,6)", "BOOLEAN"}
+
+    if fmt in numeric_formats:
+        if d >= 0.60 and m <= 0:
             return "Measure"
-        if distinct_pct <= 0.02 and missing_values == 0:
+        if d <= 0.02 and m <= 0:
             return "Dimension"
         return "Dimension Attribute"
-    if format_value in {"DATE", "TIMESTAMP"}:
-        return "Dimension" if missing_values == 0 else "Dimension Attribute"
-    if distinct_pct >= 0.85 and missing_values == 0:
+
+    if fmt in {"DATE", "TIMESTAMP"}:
+        if m <= 0:
+            return "Dimension"
+        return "Dimension Attribute"
+
+    if d >= 0.85 and m <= 0:
         return "Degenerate Dimension"
-    if distinct_pct <= 0.02 and missing_values == 0:
+    if d <= 0.02 and m <= 0:
         return "Dimension"
     return "Dimension Attribute"
 
 
-def build_rows(
-    source_extract: str, profile_rows: list[dict[str, str]], names: list[str]
-) -> list[dict[str, str]]:
+def build_new_rows(
+    source_extract: str, profile_rows: list[dict], column_names: list[str]
+) -> list[dict]:
+    rows = []
     target_table = infer_target_table_name(source_extract)
-    rows: list[dict[str, str]] = []
-    for source_column, profile_row in zip(names, profile_rows):
-        format_value = canonical_format_from_dtype(profile_row.get("dtype", ""))
-        role = suggest_business_role(
-            format_value,
-            to_float(profile_row.get("distinct_pct")),
-            to_int(profile_row.get("missing_values")),
-        )
+    for source_column, profile_row in zip(column_names, profile_rows):
+        dtype = (profile_row.get("dtype") or "").strip()
+        distinct_pct = to_float(profile_row.get("distinct_pct"))
+        missing_values = to_int(profile_row.get("missing_values"))
+        fmt = canonical_format_from_dtype(dtype)
+        business_role = suggest_business_role(fmt, distinct_pct, missing_values)
+
         rows.append(
             {
                 "Source Extract": source_extract,
                 "Source Column": source_column,
                 "Target Table": target_table,
                 "Target Column Name": "",
-                "Type": "Optional",
-                "Business Role": role,
-                "Format": format_value,
+                "Type": DEFAULT_TYPE,
+                "Business Role": business_role,
+                "Format": fmt,
                 "Primary/Unique Key": "",
                 "PII/Sensitivity": "",
                 "Allowed Values": "",
                 "Rejected Values": "",
                 "Description": "",
-                "Notes": "Suggested from profiling statistics; review required.",
-                "Status": "Draft",
+                "Notes": (
+                    "Auto-suggested from profiling thresholds "
+                    "(Format + distinct_pct + missing_values); review required"
+                ),
+                "Status": DEFAULT_STATUS,
             }
         )
     return rows
 
 
-def read_existing_spec(output_path: Path) -> list[dict[str, str]]:
-    with output_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        return list(csv.DictReader(handle))
+def read_existing_spec(output_path: Path) -> list[dict]:
+    with open(output_path, "r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
 
 
-def write_spec(rows: list[dict[str, str]], output_path: Path) -> None:
+def write_spec(rows: list[dict], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SPEC_COLUMNS)
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SPEC_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def build_spec(
-    input_path: Path, output_path: Path | None = None
-) -> tuple[Path, int, int, str]:
-    profile_rows, delimiter = read_profile_rows(input_path)
-    source_extract = infer_source_extract_name(input_path)
-    resolved_output = output_path or default_output_path(input_path)
-    existing_rows = (
-        read_existing_spec(resolved_output) if resolved_output.exists() else []
-    )
-    existing_pairs = {
-        (row.get("Source Extract", ""), row.get("Source Column", ""))
-        for row in existing_rows
-    }
-    candidates = build_rows(
-        source_extract, profile_rows, normalized_column_names(profile_rows)
-    )
-    new_rows = [
-        row
-        for row in candidates
-        if (row["Source Extract"], row["Source Column"]) not in existing_pairs
-    ]
-    write_spec(existing_rows + new_rows, resolved_output)
-    return resolved_output, len(new_rows), len(candidates) - len(new_rows), delimiter
+def profile_base_name(input_file: Path) -> str:
+    stem = input_file.stem
+    return stem[:-10] if stem.endswith("_profiling") else stem
 
 
-def main() -> int:
+def default_output_path(input_file: Path) -> Path:
+    """Prefer data/5_spec/<stage>/<name>.spec.csv for data/4_profiling inputs.
+    Falls back to placing the spec next to the input file otherwise.
+    """
+    base_name = profile_base_name(input_file)
+    parts = list(input_file.parts)
+    if "4_profiling" in parts:
+        idx = parts.index("4_profiling")
+        parts[idx] = "5_spec"
+        return Path(*parts[:-1]) / f"{base_name}.spec.csv"
+    return input_file.with_name(f"{base_name}.spec.csv")
+
+
+def infer_source_extract_name(input_file: Path) -> str:
+    """Infer source extract name from a *_profiling.csv file name."""
+    return f"{profile_base_name(input_file)}.csv"
+
+
+def infer_target_table_name(source_extract: str) -> str:
+    """Infer target staging table as stg_<source_extract_stem>."""
+    return f"stg_{Path(source_extract).stem}"
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a Table Specification from a profiling report."
+        description="Build or extend a Table Specification from a profiling CSV file."
     )
-    parser.add_argument("input_file", type=Path)
-    parser.add_argument("-o", "--output", type=Path)
+    parser.add_argument(
+        "input_file",
+        type=Path,
+        help="Path to the profiling file (typically *_profiling.csv)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Path to the spec file to create or extend (default: inferred from the data/4_profiling -> data/5_spec convention)",
+    )
     args = parser.parse_args()
+
     if not args.input_file.exists():
         print(f"Error: input file not found: {args.input_file}", file=sys.stderr)
-        return 1
+        sys.exit(1)
+
     try:
-        output_path, added, skipped, delimiter = build_spec(
-            args.input_file, args.output
-        )
-    except ValueError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return 1
+        profile_rows, delimiter = read_profile_rows(args.input_file)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    column_names = dedupe_and_fill_profile_columns(profile_rows)
+    source_extract = infer_source_extract_name(args.input_file)
+
+    if args.output:
+        output_path = args.output
+    else:
+        output_path = default_output_path(args.input_file)
+        print(f"No output path given — inferred: {output_path}")
+
+    existing_rows: list[dict] = []
+    if output_path.exists():
+        existing_rows = read_existing_spec(output_path)
+
+        # Deterministically backfill missing Target Table values in legacy specs.
+        for row in existing_rows:
+            target_table = (row.get("Target Table") or "").strip()
+            source_for_row = (row.get("Source Extract") or "").strip()
+            if not target_table and source_for_row:
+                row["Target Table"] = infer_target_table_name(source_for_row)
+
+        # Whole-file immutability: once every row is Approved, the file is locked.
+        if existing_rows and all(
+            r.get("Status", "").strip() == "Approved" for r in existing_rows
+        ):
+            print(
+                f"Error: {output_path} is fully Approved and is treated as immutable.\n"
+                f"Copy it forward to a new version (e.g. {output_path.stem}.v2.csv) before extending it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        already_present = {
+            (r.get("Source Extract", ""), r.get("Source Column", ""))
+            for r in existing_rows
+        }
+        new_rows = [
+            row
+            for row in build_new_rows(source_extract, profile_rows, column_names)
+            if (row["Source Extract"], row["Source Column"]) not in already_present
+        ]
+        skipped = len(profile_rows) - len(new_rows)
+    else:
+        new_rows = build_new_rows(source_extract, profile_rows, column_names)
+        skipped = 0
+
+    write_spec(existing_rows + new_rows, output_path)
+
     print(f"Detected delimiter: {DELIMITER_NAMES.get(delimiter, repr(delimiter))}")
-    print(f"Added {added} row(s); skipped {skipped} existing row(s).")
+    print(f"Profile rows found: {len(profile_rows)}")
+    print(f"Source extract inferred: {source_extract}")
+
+    adjustments = [
+        (raw.strip() or "(blank)", new)
+        for raw, new in zip(
+            [(r.get("column") or "") for r in profile_rows], column_names
+        )
+        if (raw.strip() or "(blank)") != new
+    ]
+    if adjustments:
+        print("Adjusted names (blank/duplicate headers):")
+        for original, new in adjustments:
+            print(f"  {original!r} -> {new!r}")
+
+    if skipped:
+        print(
+            f"Skipped {skipped} row(s) already present in the spec for this source extract."
+        )
+
+    by_role: dict[str, int] = {}
+    for row in new_rows:
+        role = row["Business Role"]
+        by_role[role] = by_role.get(role, 0) + 1
+    if by_role:
+        print("Suggested Business Role counts:")
+        for role in sorted(by_role):
+            print(f"  {role}: {by_role[role]}")
+
+    print(f"Added {len(new_rows)} new row(s).")
     print(f"Specification written to: {output_path}")
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
