@@ -109,7 +109,7 @@ class TemplateStructureTests(unittest.TestCase):
     )
     def test_profiler_writes_stage_aware_report(self) -> None:
         profiler = (
-            ROOT / ".github/skills/md-flat-file-profiling/scripts/profile_file.py"
+            ROOT / ".github/skills/md-source-extract-profiling/scripts/profile_file.py"
         )
         with tempfile.TemporaryDirectory(dir=ROOT / "data" / "2_interim") as directory:
             source = Path(directory) / "source.csv"

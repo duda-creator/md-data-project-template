@@ -56,9 +56,9 @@ Data is ignored by default. Commit only small, non-sensitive sample data when it
 
 ## Optional Capabilities
 
-### Flat-file profiling
+### Source-extract profiling
 
-Invoke [`md-flat-file-profiling`](.github/skills/md-flat-file-profiling/SKILL.md) with `\md-flat-file-profiling` to generate a column-level report for supported flat files. Reports are written to `data/4_profiling/` and do not alter the source file.
+Invoke [`md-source-extract-profiling`](.github/skills/md-source-extract-profiling/SKILL.md) with `\md-source-extract-profiling` to generate a column-level report for supported flat files. Reports are written to `data/4_profiling/` and do not alter the source file.
 
 ### Data contracts and staging
 
@@ -74,7 +74,7 @@ Invoke [`md-reconciliation-design`](.github/skills/md-reconciliation-design/SKIL
 
 ### Recommended design sequence
 
-1. Use `\md-flat-file-profiling` to understand source-file structure and quality.
+1. Use `\md-source-extract-profiling` to understand source-file structure and quality.
 2. Use `\md-table-spec-builder` to create and review source-to-target specifications.
 3. Use `\md-semantic-layer-design` to define facts, dimensions, measures, ownership, and model decisions.
 4. Use `\md-reconciliation-design` only when existing reports or measures need explicit validation against the proposed semantic layer.
@@ -100,7 +100,7 @@ A fictional APAC Corporate and Investment Bank Treasury team receives position, 
    ```
 
 2. Record a current-state inventory in `references/current-state-inventory.md`: owner, refresh time, grain, entity and currency coverage, manual adjustments, reconciliation points, report consumers, and known data-quality issues. Map the process from source systems through transformations and reconciliations to the management report and required actions.
-3. Invoke `\md-flat-file-profiling` to profile important extracts, such as `data/1_raw/liquidity_positions_2026-09-04.csv`. It creates a descriptive report in `data/4_profiling/1_raw/` without modifying the source file. Invoke `\md-table-spec-builder` with that profiling report to create a draft Table Specification in `data/5_spec/1_raw/`.
+3. Invoke `\md-source-extract-profiling` to profile important extracts, such as `data/1_raw/liquidity_positions_2026-09-04.csv`. It creates a descriptive report in `data/4_profiling/1_raw/` without modifying the source file. Invoke `\md-table-spec-builder` with that profiling report to create a draft Table Specification in `data/5_spec/1_raw/`.
 
 4. Review source grain, as-of timestamp, legal entity, currency, product or business line, source identifier, balances, movements, funding type, and liquid-asset classification. Treasury measures must have explicit time, entity, and currency semantics.
 5. Invoke `\md-semantic-layer-design` to define approved facts at an agreed position grain and conformed Legal Entity, Currency, Product or Business, Date, and Funding or Liquidity Classification dimensions. Document metric owners, golden sources, reconciliation direction, date logic, exclusions, and report-facing measures such as Total Liquidity Position, Available Liquidity, Liquidity Buffer, Funding Requirement, and daily variance.
